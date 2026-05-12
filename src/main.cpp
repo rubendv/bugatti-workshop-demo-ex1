@@ -1,6 +1,16 @@
+// =============================================================================
+// Bitcoin Ticker firmware for M5Stick (ESP32)
+//
+// - Connects to WiFi (WPA2-Personal or WPA2-Enterprise depending on build)
+// - Fetches the current Bitcoin price from CoinGecko every 10 seconds
+// - Checks GitHub for newer firmware releases every 60 seconds
+// - Performs an OTA (over-the-air) firmware update when a newer version exists
+// =============================================================================
+
 #include <M5Unified.h>
 #include "WiFi.h"
 #include "esp_wifi.h"
+// Optional WPA2-Enterprise support: only compiled in if the header is available
 #if __has_include("esp_wpa2.h")
 #include "esp_wpa2.h"
 #define HAS_WPA2_ENTERPRISE 1
@@ -12,6 +22,8 @@
 #include "HTTPClient.h"
 #include "Update.h"
 
+#define FIRMWARE_VERSION "1.0.0"
+
 // WiFi and GitHub credentials handling:
 // - GitHub Actions: Uses temporary header file (include/wifi_config.h) with secrets injected at build time
 // - Local development: Uses environment variables via platformio.ini build_flags
@@ -21,6 +33,15 @@
   #include "wifi_config.h"
 #else
   // Local development: Use environment variables passed via build_flags
+
+  #ifndef GITHUB_TOKEN
+  #define GITHUB_TOKEN ""
+  #endif
+
+  #ifndef D_WIFI_USER
+  #define D_WIFI_USER ""
+  #endif
+
   #ifndef D_WIFI_SSID
   #define D_WIFI_SSID ""
   #endif
@@ -28,34 +49,35 @@
   #ifndef D_WIFI_PASS
   #define D_WIFI_PASS ""
   #endif
-
-  #ifndef D_WIFI_USER
-  #define D_WIFI_USER ""
-  #endif
   
-  #ifndef GITHUB_TOKEN
-  #define GITHUB_TOKEN ""
-  #endif
 #endif
 
+// For WPA2-Enterprise networks, the identity is typically the same as the username
 #define D_WIFI_IDENTITY D_WIFI_USER
 
-#define FIRMWARE_VERSION "1.0.0"
+// Endpoints and identifiers used by the firmware
 #define BITCOIN_PRICE_ENDPOINT "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-#define GITHUB_REPO "giacomobenedetti/test-it"
 #define GITHUB_API_ENDPOINT "https://api.github.com/repos/giacomobenedetti/test-it/releases/latest"
+#define GITHUB_REPO "giacomobenedetti/test-it"
 
+
+// ---- Global state -----------------------------------------------------------
+// Bitcoin price tracking
 static uint32_t g_bitcoinPriceUsd = 0;
 static uint32_t g_lastBitcoinCheckMs = 0;
-static const uint32_t BITCOIN_CHECK_INTERVAL_MS = 10000;
+static const uint32_t BITCOIN_CHECK_INTERVAL_MS = 10000;   // poll price every 10 s
 
+// Firmware update tracking
 static uint32_t g_lastFirmwareCheckMs = 0;
-static const uint32_t FIRMWARE_CHECK_INTERVAL_MS = 60000;
+static const uint32_t FIRMWARE_CHECK_INTERVAL_MS = 60000;  // poll GitHub every 60 s
 static char g_latestFirmwareVersion[32] = FIRMWARE_VERSION;
 static String g_firmwareDownloadUrl = "";
+
+// Status message shown on the device display
 static String g_lastStatusMsg = "";
 static uint32_t g_lastStatusUpdateMs = 0;
 
+// Updates the on-screen status line and mirrors it to the serial log
 static void setStatus(const char* msg) {
 	g_lastStatusMsg = msg;
 	g_lastStatusUpdateMs = millis();
@@ -67,15 +89,23 @@ static void setStatus(const char* msg) {
 	M5.Lcd.setTextSize(1);
 }
 
+// Forward declaration: defined further down, called from checkFirmwareUpdate()
 static void performFirmwareUpdate();
 
 
+// -----------------------------------------------------------------------------
+// fetchBitcoinPrice
+// Calls the CoinGecko price endpoint, parses the BTC/USD value from the JSON
+// response, and updates both the global price and the on-screen display.
+// -----------------------------------------------------------------------------
 static void fetchBitcoinPrice() {
 	if (WiFi.status() != WL_CONNECTED) {
 		Serial.println("Bitcoin fetch: WiFi not connected");
 		return;
 	}
 
+	// Use an insecure TLS client: skips certificate validation.
+	// Acceptable for a demo; in production you'd pin the CA or use a cert bundle.
 	WiFiClientSecure client;
 	client.setInsecure();
 
@@ -100,6 +130,8 @@ static void fetchBitcoinPrice() {
 
 	Serial.printf("Bitcoin response: %s\n", payload.c_str());
 
+	// Manual JSON parsing: locate "usd": and read the number that follows.
+	// A real JSON library would be safer, but this keeps the firmware small.
 	int pos = payload.indexOf("\"usd\":");
 	if (pos != -1) {
 		pos += 6;
@@ -122,6 +154,12 @@ static void fetchBitcoinPrice() {
 }
 
 
+// -----------------------------------------------------------------------------
+// checkFirmwareUpdate
+// Queries the GitHub Releases API for the latest release of this project.
+// If the latest tag differs from FIRMWARE_VERSION, locates the firmware.bin
+// asset URL and triggers an OTA update.
+// -----------------------------------------------------------------------------
 static void checkFirmwareUpdate() {
 	if (WiFi.status() != WL_CONNECTED) {
 		Serial.println("Firmware check: WiFi not connected");
@@ -135,7 +173,9 @@ static void checkFirmwareUpdate() {
 
 	HTTPClient http;
 	http.setTimeout(5000);
+	// GitHub's API requires a User-Agent header on every request
 	http.addHeader("User-Agent", "esp32-iot-device");
+	// Authenticated requests have a higher rate limit than anonymous ones
 	http.addHeader("Authorization", "token " + String(GITHUB_TOKEN));
 	http.addHeader("Accept", "application/vnd.github.v3+json");
 
@@ -152,6 +192,7 @@ static void checkFirmwareUpdate() {
 	String allHeaders = http.header("Server");
 	Serial.printf("Server: %s\n", allHeaders.c_str());
 
+	// 403 from GitHub usually means we hit the API rate limit
 	if (httpCode == 403) {
 		setStatus("Rate limit");
 		Serial.println("❌ GitHub API rate limit exceeded. Waiting...");
@@ -176,7 +217,7 @@ static void checkFirmwareUpdate() {
 	Serial.printf("Response length: %d bytes\n", payload.length());
 	Serial.printf("First 500 chars: %.500s\n", payload.c_str());
 
-	// Extract tag_name
+	// Extract the release tag name (e.g. "v1.0.1") from the JSON response
 	int tagPos = payload.indexOf("\"tag_name\":");
 	Serial.printf("tag_name position: %d\n", tagPos);
 
@@ -210,7 +251,7 @@ static void checkFirmwareUpdate() {
 		return;
 	}
 
-	// Find all browser_download_url entries and look for firmware.bin
+	// A release can have multiple assets — walk the list and pick firmware.bin
 	int searchStart = assetsPos;
 	int urlPos = -1;
 
@@ -240,6 +281,7 @@ static void checkFirmwareUpdate() {
 	g_firmwareDownloadUrl = payload.substring(urlPos, urlEnd);
 	Serial.printf("✓ Download URL: %s\n", g_firmwareDownloadUrl.c_str());
 
+	// Only update if the latest tag is different from what's currently running
 	if (latestVersion != FIRMWARE_VERSION) {
 		setStatus("Updating...");
 		Serial.printf("✓ New firmware available: %s > %s\n",
@@ -252,6 +294,11 @@ static void checkFirmwareUpdate() {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// performFirmwareUpdate
+// Downloads firmware.bin from the URL discovered by checkFirmwareUpdate(),
+// streams it into the ESP32 Update partition, and reboots on success.
+// -----------------------------------------------------------------------------
 static void performFirmwareUpdate() {
 	Serial.println("=== Starting firmware update ===");
 	setStatus("DL firmware...");
@@ -285,6 +332,7 @@ static void performFirmwareUpdate() {
 		return;
 	}
 
+	// We need the Content-Length up front so the OTA partition can be sized
 	int contentLength = http.getSize();
 	Serial.printf("Content-Length: %d bytes\n", contentLength);
 
@@ -296,6 +344,7 @@ static void performFirmwareUpdate() {
 
 	Serial.printf("✓ Starting OTA write (%d bytes)...\n", contentLength);
 
+	// Update.begin() reserves space in the inactive OTA partition
 	if (!Update.begin(contentLength)) {
 		Serial.println("❌ Not enough space to begin OTA");
 		http.end();
@@ -316,6 +365,7 @@ static void performFirmwareUpdate() {
 		return;
 	}
 
+	// writeStream() reads from the HTTP stream and writes directly to flash
 	size_t written = Update.writeStream(*stream);
 	Serial.printf("Stream write complete: %zu bytes\n", written);
 
@@ -329,6 +379,7 @@ static void performFirmwareUpdate() {
 
 	Serial.printf("✓ Wrote %zu bytes\n", written);
 
+	// Update.end() finalizes the new partition; isFinished() confirms validity
 	if (!Update.end()) {
 		Serial.printf("❌ OTA Failed: %s\n", Update.errorString());
 		return;
@@ -343,16 +394,24 @@ static void performFirmwareUpdate() {
 	setStatus("Success! Rebooting");
 	http.end();
 	delay(1000);
+	// After restart, the bootloader will boot from the freshly written partition
 	ESP.restart();
 }
 
 
 
+// -----------------------------------------------------------------------------
+// connectToWifi
+// Initializes WiFi in station mode. Uses WPA2-Enterprise authentication
+// if the ESP-IDF WPA2 enterprise headers are available, otherwise falls
+// back to standard WPA2-Personal (SSID + password).
+// -----------------------------------------------------------------------------
 static void connectToWifi() {
 	WiFi.disconnect(true);
 	WiFi.mode(WIFI_STA);
 
 #if HAS_WPA2_ENTERPRISE
+	// WPA2-Enterprise: provide identity, username, and password separately
 	esp_wifi_sta_wpa2_ent_set_identity(reinterpret_cast<const uint8_t *>(D_WIFI_IDENTITY),
 										 strlen(D_WIFI_IDENTITY));
 	esp_wifi_sta_wpa2_ent_set_username(reinterpret_cast<const uint8_t *>(D_WIFI_USER),
@@ -363,14 +422,21 @@ static void connectToWifi() {
 	esp_wifi_sta_wpa2_ent_enable();
 	WiFi.begin(D_WIFI_SSID);
 #else
+	// WPA2-Personal: just SSID + pre-shared key
 	WiFi.begin(D_WIFI_SSID, D_WIFI_PASS);
 #endif
 }
 
+// -----------------------------------------------------------------------------
+// setup
+// Standard Arduino entry point. Initializes serial, the M5 display, WiFi,
+// then performs an initial Bitcoin price fetch and firmware update check.
+// -----------------------------------------------------------------------------
 void setup() {
 	Serial.begin(115200);
 	delay(500);
 
+	// Initialize the M5 board and the LCD
 	M5.begin();
 	M5.Lcd.setRotation(3);
 	M5.Lcd.fillScreen(BLACK);
@@ -382,6 +448,7 @@ void setup() {
 	Serial.print("connecting");
 	delay(5000);
 
+	// Block until we have an IP — without networking the rest of the device is useless
 	while(WiFi.status() != WL_CONNECTED) {
 		Serial.print(".");
 		delay(500);
@@ -403,6 +470,11 @@ void setup() {
 	checkFirmwareUpdate();
 }
 
+// -----------------------------------------------------------------------------
+// loop
+// Main run loop. Polls the Bitcoin price and the GitHub release feed on
+// independent timers and updates the corresponding display lines.
+// -----------------------------------------------------------------------------
 void loop() {
 	M5.update();
 	const uint32_t now = millis();
